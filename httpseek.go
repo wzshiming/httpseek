@@ -89,8 +89,8 @@ func (s *Seeker) Close() error {
 	return nil
 }
 
-func (s *Seeker) Response() *http.Response {
-	return s.resp
+func (s *Seeker) Response() (*http.Response, bool) {
+	return s.resp, s.size > 0
 }
 
 func (s *Seeker) reset() {
@@ -111,14 +111,7 @@ func reader(transport http.RoundTripper, req *http.Request, readerOffset int64) 
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, 0, nil, fmt.Errorf("unexpected status resolving reader: %v: %v", resp.Status, err)
-		}
-		return nil, 0, nil, fmt.Errorf("unexpected status resolving reader: %v: %s", resp.Status, string(body))
-
+		return resp.Body, -1, resp, nil
 	}
 
 	if resp.StatusCode == http.StatusOK {

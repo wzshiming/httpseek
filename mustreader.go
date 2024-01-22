@@ -61,11 +61,11 @@ func (r *mustReader) read(p []byte) (n int, err error) {
 
 type mustReaderTransport struct {
 	baseTransport http.RoundTripper
-	errorHandler  func(error) error
+	errorHandler  func(*http.Request, error) error
 }
 
 // NewMustReaderTransport returns a transport that will retry reading with partial byte ranges if the underlying transport returns an error.
-func NewMustReaderTransport(baseTransport http.RoundTripper, errorHandler func(error) error) http.RoundTripper {
+func NewMustReaderTransport(baseTransport http.RoundTripper, errorHandler func(*http.Request, error) error) http.RoundTripper {
 	return &mustReaderTransport{
 		baseTransport: baseTransport,
 		errorHandler:  errorHandler,
@@ -85,15 +85,21 @@ func (t *mustReaderTransport) RoundTrip(r *http.Request) (*http.Response, error)
 			break
 		}
 		if t.errorHandler != nil {
-			if err = t.errorHandler(err); err != nil {
+			if err = t.errorHandler(r, err); err != nil {
 				return nil, err
 			}
 		}
 	}
 
-	mr := NewMustReader(rsc, t.errorHandler)
+	mr := NewMustReader(rsc, func(err error) error {
+		return t.errorHandler(r, err)
+	})
 
-	resp := *rsc.Response()
+	resp, ok := rsc.Response()
+	if !ok {
+		return resp, nil
+	}
+
 	resp.Body = struct {
 		io.Reader
 		io.Closer
@@ -102,5 +108,5 @@ func (t *mustReaderTransport) RoundTrip(r *http.Request) (*http.Response, error)
 		Closer: rsc,
 	}
 
-	return &resp, nil
+	return resp, nil
 }
