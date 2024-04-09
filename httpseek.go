@@ -12,10 +12,20 @@ import (
 )
 
 var (
+	contentRangeKey    = "Content-Range"
 	contentRangeRegexp = regexp.MustCompile(`bytes ([0-9]+)-([0-9]+)/([0-9]+|\\*)`)
 
 	// ErrCodeForByteRange is returned when the HTTP status code is not 206 for a byte range request.
 	ErrCodeForByteRange = errors.New("expected HTTP 206 from byte range request")
+
+	// ErrNoContentRange is returned when the Content-Range header is missing from a 206 response.
+	ErrNoContentRange = errors.New("no Content-Range header found in HTTP 206 response")
+)
+
+var (
+	_ io.Seeker = (*Seeker)(nil)
+	_ io.Reader = (*Seeker)(nil)
+	_ io.Closer = (*Seeker)(nil)
 )
 
 // NewSeeker handles reading from an HTTP endpoint using a GET request.
@@ -24,40 +34,48 @@ func NewSeeker(ctx context.Context, transport http.RoundTripper, req *http.Reque
 		ctx:       ctx,
 		transport: transport,
 		req:       req,
+		size:      -1,
 	}
 }
 
 type Seeker struct {
-	ctx       context.Context
-	transport http.RoundTripper
-	req       *http.Request
-	resp      *http.Response
+	ctx           context.Context
+	transport     http.RoundTripper
+	req           *http.Request
+	firstResponse *http.Response
 
 	rc     io.ReadCloser
-	offset int64
+	offset uint64
 	size   int64
 }
 
 func (s *Seeker) Read(p []byte) (n int, err error) {
 	if s.rc == nil {
-		err = s.seek(s.offset)
+		err = s.seek(s.ctx, s.offset)
 		if err != nil {
 			return 0, err
 		}
 	}
 
 	n, err = s.rc.Read(p)
-	s.offset += int64(n)
+	s.offset += uint64(n)
+	if err != nil && int64(s.offset) < s.size {
+		_ = s.reset()
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}
 	return n, err
 }
 
+// Seek sets the offset for the next Read to offset.
 func (s *Seeker) Seek(offset int64, whence int) (int64, error) {
 	var newOffset int64
 	switch whence {
 	case io.SeekStart:
 		newOffset = offset
 	case io.SeekCurrent:
-		newOffset = s.offset + offset
+		newOffset = int64(s.offset) + offset
 	case io.SeekEnd:
 		if s.size <= 0 {
 			// TODO: make a HEAD request to get the content length
@@ -65,72 +83,89 @@ func (s *Seeker) Seek(offset int64, whence int) (int64, error) {
 		}
 		newOffset = s.size + offset
 	}
+	if newOffset < 0 {
+		return 0, errors.New("negative offset")
+	}
 
-	return newOffset, s.seek(newOffset)
+	return newOffset, s.seek(s.ctx, uint64(newOffset))
 }
 
-func (s *Seeker) seek(offset int64) error {
-	r, size, resp, err := reader(s.transport, s.req.Clone(s.ctx), offset)
+func (s *Seeker) seek(ctx context.Context, offset uint64) error {
+	r, size, resp, err := reader(ctx, s.transport, s.req, offset, s.size)
 	if err != nil {
 		return err
 	}
-	s.reset()
+	_ = s.reset()
 	if offset == 0 {
-		s.resp = resp
+		s.firstResponse = resp
 	}
 	s.size = size
 	s.offset = offset
 	s.rc = r
-	return err
-}
-
-func (s *Seeker) Close() error {
-	s.reset()
 	return nil
 }
 
-func (s *Seeker) Response() (*http.Response, bool) {
-	return s.resp, s.size > 0
+// Close closes the Seeker.
+func (s *Seeker) Close() error {
+	return s.reset()
 }
 
-func (s *Seeker) reset() {
-	if s.rc == nil {
-		return
+// Response returns the first HTTP response received from the server.
+func (s *Seeker) Response() (*http.Response, error) {
+	if s.firstResponse == nil {
+		err := s.seek(s.ctx, 0)
+		if err != nil {
+			return nil, err
+		}
 	}
-	_ = s.rc.Close()
-	s.rc = nil
+	return s.firstResponse, nil
 }
 
-func reader(transport http.RoundTripper, req *http.Request, readerOffset int64) (io.ReadCloser, int64, *http.Response, error) {
+// Size returns the content length of the HTTP response.
+func (s *Seeker) Size() int64 {
+	return s.size
+}
+
+// Offset returns the current offset of the Seeker.
+func (s *Seeker) Offset() uint64 {
+	return s.offset
+}
+
+func (s *Seeker) reset() error {
+	if s.rc == nil {
+		return nil
+	}
+	err := s.rc.Close()
+	s.rc = nil
+	return err
+}
+
+func reader(ctx context.Context, transport http.RoundTripper, req *http.Request, readerOffset uint64, readerSize int64) (io.ReadCloser, int64, *http.Response, error) {
+	req = req.Clone(ctx)
 	if readerOffset > 0 {
 		req.Header.Add("Range", fmt.Sprintf("bytes=%d-", readerOffset))
 	}
 
 	resp, err := transport.RoundTrip(req)
 	if err != nil {
-		return nil, 0, nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return resp.Body, -1, resp, nil
+		return nil, -1, nil, err
 	}
 
-	if resp.StatusCode == http.StatusOK {
-		return resp.Body, resp.ContentLength, resp, nil
-	}
-
-	if readerOffset > 0 {
-		if resp.StatusCode != http.StatusPartialContent {
-			return nil, 0, nil, ErrCodeForByteRange
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusNoContent:
+		if readerOffset == 0 {
+			return resp.Body, resp.ContentLength, resp, nil
 		}
-
-		contentRange := resp.Header.Get("Content-Range")
+		return nil, -1, nil, ErrCodeForByteRange
+	case http.StatusPartialContent:
+		contentRange := resp.Header.Get(contentRangeKey)
 		if contentRange == "" {
-			return nil, 0, nil, errors.New("no Content-Range header found in HTTP 206 response")
+			return nil, -1, nil, ErrNoContentRange
 		}
 
-		s, err := getContentLength(contentRange, uint64(readerOffset))
+		s, err := getContentLength(contentRange, readerOffset, readerSize)
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, -1, nil, err
 		}
 		return resp.Body, s, nil, nil
 	}
@@ -138,7 +173,7 @@ func reader(transport http.RoundTripper, req *http.Request, readerOffset int64) 
 	return resp.Body, -1, resp, nil
 }
 
-func getContentLength(contentRange string, readerOffset uint64) (int64, error) {
+func getContentLength(contentRange string, readerOffset uint64, readerSize int64) (int64, error) {
 	submatches := contentRangeRegexp.FindStringSubmatch(contentRange)
 	if len(submatches) < 4 {
 		return 0, fmt.Errorf("could not parse Content-Range header: %s", contentRange)
@@ -169,6 +204,10 @@ func getContentLength(contentRange string, readerOffset uint64) (int64, error) {
 
 	if endByte+1 != size {
 		return 0, fmt.Errorf("range in Content-Range stops before the end of the content: %s", contentRange)
+	}
+
+	if readerOffset > 0 && size != uint64(readerSize) {
+		return 0, fmt.Errorf("Content-Range size: %d does not match expected size: %d", size, readerSize)
 	}
 
 	if size > math.MaxInt64 {
