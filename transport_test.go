@@ -15,7 +15,7 @@ func TestMustReadTransport(t *testing.T) {
 		http.ServeContent(&errorResponseWriter{rw: w, n: rand.Intn(3)}, r, "test", time.Time{}, bytes.NewReader([]byte("Hello World!")))
 	}))
 
-	s.Client().Transport = NewMustReaderTransport(s.Client().Transport, func(r *http.Request, err error) error {
+	s.Client().Transport = NewMustReaderTransport(s.Client().Transport, func(r *http.Request, retry int, err error) error {
 		return nil
 	})
 

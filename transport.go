@@ -6,11 +6,11 @@ import (
 
 type mustReaderTransport struct {
 	baseTransport http.RoundTripper
-	errorHandler  func(*http.Request, error) error
+	errorHandler  func(*http.Request, int, error) error
 }
 
 // NewMustReaderTransport returns a transport that will retry reading with partial byte ranges if the underlying transport returns an error.
-func NewMustReaderTransport(baseTransport http.RoundTripper, errorHandler func(*http.Request, error) error) http.RoundTripper {
+func NewMustReaderTransport(baseTransport http.RoundTripper, errorHandler func(*http.Request, int, error) error) http.RoundTripper {
 	return &mustReaderTransport{
 		baseTransport: baseTransport,
 		errorHandler:  errorHandler,
@@ -23,6 +23,7 @@ func (t *mustReaderTransport) RoundTrip(r *http.Request) (resp *http.Response, e
 		return t.baseTransport.RoundTrip(r)
 	}
 
+	var retry = 0
 	rsc := NewSeeker(r.Context(), t.baseTransport, r)
 	for {
 		resp, err = rsc.Response()
@@ -30,9 +31,10 @@ func (t *mustReaderTransport) RoundTrip(r *http.Request) (resp *http.Response, e
 			break
 		}
 		if t.errorHandler != nil {
-			if err = t.errorHandler(r, err); err != nil {
+			if err = t.errorHandler(r, retry, err); err != nil {
 				return nil, err
 			}
+			retry++
 		}
 	}
 
@@ -41,10 +43,10 @@ func (t *mustReaderTransport) RoundTrip(r *http.Request) (resp *http.Response, e
 		return resp, nil
 	}
 
-	var readerErrorHandler func(err error) error
+	var readerErrorHandler func(retry int, err error) error
 	if t.errorHandler != nil {
-		readerErrorHandler = func(err error) error {
-			return t.errorHandler(r, err)
+		readerErrorHandler = func(retry0 int, err error) error {
+			return t.errorHandler(r, retry+retry0, err)
 		}
 	}
 

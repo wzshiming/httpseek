@@ -6,12 +6,12 @@ import (
 
 type mustReader struct {
 	rsc          io.ReadSeeker
-	errorHandler func(error) error
+	errorHandler func(int, error) error
 	offset       int
 }
 
 // NewMustReader returns a reader that will retry reading with partial byte ranges if the underlying reader returns an error.
-func NewMustReader(rsc io.ReadSeeker, errorHandler func(error) error) io.Reader {
+func NewMustReader(rsc io.ReadSeeker, errorHandler func(int, error) error) io.Reader {
 	return &mustReader{
 		rsc:          rsc,
 		errorHandler: errorHandler,
@@ -19,7 +19,7 @@ func NewMustReader(rsc io.ReadSeeker, errorHandler func(error) error) io.Reader 
 }
 
 // NewMustReadCloser returns a reader that will retry reading with partial byte ranges if the underlying reader returns an error.
-func NewMustReadCloser(rsc io.ReadSeekCloser, errorHandler func(error) error) io.ReadCloser {
+func NewMustReadCloser(rsc io.ReadSeekCloser, errorHandler func(int, error) error) io.ReadCloser {
 	return struct {
 		io.Reader
 		io.Closer
@@ -31,6 +31,10 @@ func NewMustReadCloser(rsc io.ReadSeekCloser, errorHandler func(error) error) io
 
 // Read reads from the reader.
 func (r *mustReader) Read(p []byte) (n int, err error) {
+	return r.read(0, p)
+}
+
+func (r *mustReader) read(retry int, p []byte) (n int, err error) {
 	n, err = r.rsc.Read(p)
 	r.offset += n
 	if err == nil {
@@ -42,7 +46,7 @@ func (r *mustReader) Read(p []byte) (n int, err error) {
 	}
 
 	if r.errorHandler != nil {
-		if err = r.errorHandler(err); err != nil {
+		if err = r.errorHandler(retry, err); err != nil {
 			return n, err
 		}
 	}
@@ -50,5 +54,5 @@ func (r *mustReader) Read(p []byte) (n int, err error) {
 	if n != 0 {
 		return n, nil
 	}
-	return r.Read(p)
+	return r.read(retry+1, p)
 }
