@@ -147,30 +147,47 @@ func reader(ctx context.Context, transport http.RoundTripper, req *http.Request,
 		req.Header.Add(rangeKey, fmt.Sprintf("bytes=%d-", readerOffset))
 	}
 
-	resp, err := transport.RoundTrip(req)
-	if err != nil {
-		return nil, -1, nil, err
-	}
-
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusNoContent:
-		if readerOffset == 0 {
-			return resp.Body, resp.ContentLength, resp, nil
-		}
-		return nil, -1, nil, ErrCodeForByteRange
-	case http.StatusPartialContent:
-		contentRange := resp.Header.Get(contentRangeKey)
-		if contentRange == "" {
-			return nil, -1, nil, ErrNoContentRange
-		}
-
-		s, err := getContentLength(contentRange, readerOffset, readerSize)
+	var resp *http.Response
+	var err error
+	for i := 0; i < 10; i++ {
+		resp, err = transport.RoundTrip(req)
 		if err != nil {
 			return nil, -1, nil, err
 		}
-		return resp.Body, s, nil, nil
-	}
 
+		switch resp.StatusCode {
+		case http.StatusOK, http.StatusNoContent:
+			if readerOffset == 0 {
+				return resp.Body, resp.ContentLength, resp, nil
+			}
+			return nil, -1, nil, ErrCodeForByteRange
+		case http.StatusPartialContent:
+			contentRange := resp.Header.Get(contentRangeKey)
+			if contentRange == "" {
+				return nil, -1, nil, ErrNoContentRange
+			}
+
+			s, err := getContentLength(contentRange, readerOffset, readerSize)
+			if err != nil {
+				return nil, -1, nil, err
+			}
+			return resp.Body, s, nil, nil
+		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+			location := resp.Header.Get("Location")
+			if location == "" {
+				return nil, -1, resp, fmt.Errorf("redirect response without location header")
+			}
+			newReq, err := http.NewRequestWithContext(ctx, req.Method, location, nil)
+			if err != nil {
+				return nil, -1, nil, err
+			}
+			newReq.Header = req.Header
+			req = newReq
+			continue
+		default:
+			return resp.Body, -1, resp, nil
+		}
+	}
 	return resp.Body, -1, resp, nil
 }
 
@@ -207,7 +224,7 @@ func getContentLength(contentRange string, readerOffset uint64, readerSize int64
 		return 0, fmt.Errorf("range in Content-Range stops before the end of the content: %s", contentRange)
 	}
 
-	if readerOffset > 0 && size != uint64(readerSize) {
+	if readerSize > 0 && size != uint64(readerSize) {
 		return 0, fmt.Errorf("Content-Range size: %d does not match expected size: %d", size, readerSize)
 	}
 
