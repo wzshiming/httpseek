@@ -12,6 +12,7 @@ import (
 )
 
 var (
+	rangeKey           = "Range"
 	contentRangeKey    = "Content-Range"
 	contentRangeRegexp = regexp.MustCompile(`bytes ([0-9]+)-([0-9]+)/([0-9]+|\\*)`)
 
@@ -143,7 +144,7 @@ func (s *Seeker) reset() error {
 func reader(ctx context.Context, transport http.RoundTripper, req *http.Request, readerOffset uint64, readerSize int64) (io.ReadCloser, int64, *http.Response, error) {
 	req = req.Clone(ctx)
 	if readerOffset > 0 {
-		req.Header.Add("Range", fmt.Sprintf("bytes=%d-", readerOffset))
+		req.Header.Add(rangeKey, fmt.Sprintf("bytes=%d-", readerOffset))
 	}
 
 	resp, err := transport.RoundTrip(req)

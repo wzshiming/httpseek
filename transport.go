@@ -23,6 +23,10 @@ func (t *mustReaderTransport) RoundTrip(r *http.Request) (resp *http.Response, e
 		return t.baseTransport.RoundTrip(r)
 	}
 
+	if r.Header.Get(rangeKey) != "" {
+		return t.baseTransport.RoundTrip(r)
+	}
+
 	var retry = 0
 	rsc := NewSeeker(r.Context(), t.baseTransport, r)
 	for {
