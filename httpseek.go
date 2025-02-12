@@ -177,7 +177,11 @@ func reader(ctx context.Context, transport http.RoundTripper, req *http.Request,
 			if location == "" {
 				return nil, -1, resp, fmt.Errorf("redirect response without location header")
 			}
-			newReq, err := http.NewRequestWithContext(ctx, req.Method, location, nil)
+			u, err := req.URL.Parse(location)
+			if err != nil {
+				return nil, -1, resp, fmt.Errorf("failed to parse %s", location)
+			}
+			newReq, err := http.NewRequestWithContext(ctx, req.Method, u.String(), nil)
 			if err != nil {
 				return nil, -1, nil, err
 			}
