@@ -175,11 +175,15 @@ func reader(ctx context.Context, transport http.RoundTripper, req *http.Request,
 		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
 			location := resp.Header.Get("Location")
 			if location == "" {
-				return nil, -1, resp, fmt.Errorf("redirect response without location header")
+				return resp.Body, -1, resp, nil
 			}
-			newReq, err := http.NewRequestWithContext(ctx, req.Method, location, nil)
+			u, err := req.URL.Parse(location)
 			if err != nil {
-				return nil, -1, nil, err
+				return resp.Body, -1, resp, nil
+			}
+			newReq, err := http.NewRequestWithContext(ctx, req.Method, u.String(), nil)
+			if err != nil {
+				return resp.Body, -1, resp, nil
 			}
 			newReq.Header = req.Header
 			req = newReq
