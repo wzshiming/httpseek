@@ -4,39 +4,55 @@ import (
 	"io"
 )
 
-type mustReader struct {
-	rsc          io.ReadSeeker
+type mustReadSeeker struct {
+	readSeeker   io.ReadSeeker
 	errorHandler func(int, error) error
-	offset       int
+	offset       int64
+	err          error
 }
 
-// NewMustReader returns a reader that will retry reading with partial byte ranges if the underlying reader returns an error.
-func NewMustReader(rsc io.ReadSeeker, errorHandler func(int, error) error) io.Reader {
-	return &mustReader{
-		rsc:          rsc,
+// NewMustReadSeeker returns a reader that will retry reading with partial byte ranges if the underlying reader returns an error.
+func NewMustReadSeeker(rsc io.ReadSeeker, offset int64, errorHandler func(int, error) error) io.ReadSeeker {
+	return &mustReadSeeker{
+		readSeeker:   rsc,
+		offset:       offset,
 		errorHandler: errorHandler,
 	}
 }
 
-// NewMustReadCloser returns a reader that will retry reading with partial byte ranges if the underlying reader returns an error.
-func NewMustReadCloser(rsc io.ReadSeekCloser, errorHandler func(int, error) error) io.ReadCloser {
+// NewMustReadSeekCloser returns a reader that will retry reading with partial byte ranges if the underlying reader returns an error.
+func NewMustReadSeekCloser(rsc io.ReadSeekCloser, offset int64, errorHandler func(int, error) error) io.ReadSeekCloser {
 	return struct {
-		io.Reader
+		io.ReadSeeker
 		io.Closer
 	}{
-		Reader: NewMustReader(rsc, errorHandler),
-		Closer: rsc,
+		ReadSeeker: NewMustReadSeeker(rsc, offset, errorHandler),
+		Closer:     rsc,
 	}
 }
 
+func (r *mustReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	abs, err := r.readSeeker.Seek(offset, whence)
+	if err != nil {
+		return abs, err
+	}
+	r.offset = abs
+	r.err = err
+	return abs, nil
+}
+
 // Read reads from the reader.
-func (r *mustReader) Read(p []byte) (n int, err error) {
+func (r *mustReadSeeker) Read(p []byte) (n int, err error) {
+	if r.err != nil {
+		return 0, r.err
+	}
 	return r.read(0, p)
 }
 
-func (r *mustReader) read(retry int, p []byte) (n int, err error) {
-	n, err = r.rsc.Read(p)
-	r.offset += n
+func (r *mustReadSeeker) read(retry int, p []byte) (n int, err error) {
+	n, err = r.readSeeker.Read(p)
+
+	r.offset += int64(n)
 	if err == nil {
 		return n, nil
 	}

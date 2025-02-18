@@ -58,6 +58,6 @@ func (t *mustReaderTransport) RoundTrip(r *http.Request) (resp *http.Response, e
 		}
 	}
 
-	resp.Body = NewMustReadCloser(rsc, readerErrorHandler)
+	resp.Body = NewMustReadSeekCloser(rsc, 0, readerErrorHandler)
 	return resp, nil
 }

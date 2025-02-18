@@ -12,11 +12,11 @@ import (
 	"time"
 )
 
-func TestMustRead(t *testing.T) {
+func TestMustReadSeeker(t *testing.T) {
 	ctx := context.Background()
 
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.ServeContent(&errorResponseWriter{rw: w, n: rand.Intn(3)}, r, "test", time.Time{}, bytes.NewReader([]byte("Hello World!")))
+		http.ServeContent(&errorResponseWriter{rw: w, n: rand.Intn(2)}, r, "test", time.Time{}, bytes.NewReader([]byte("Hello World!")))
 	}))
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
@@ -26,14 +26,18 @@ func TestMustRead(t *testing.T) {
 	rsc := NewSeeker(ctx, s.Client().Transport, req)
 	defer rsc.Close()
 
-	r := NewMustReader(rsc, nil)
+	r := NewMustReadSeeker(rsc, 0, nil)
+	_, err = r.Seek(6, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	got, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if string(got) != "Hello World!" {
-		t.Fatalf("got %q, want %q", got, "Hello World!")
+	if string(got) != "World!" {
+		t.Fatalf("got %q, want %q", got, "World!")
 	}
 }
 
