@@ -29,7 +29,7 @@ var (
 	_ io.Closer = (*Seeker)(nil)
 )
 
-// NewSeeker handles reading from an HTTP endpoint using a GET request.
+// NewSeeker creates a new Seeker for reading from an HTTP endpoint using a GET request.
 func NewSeeker(ctx context.Context, transport http.RoundTripper, req *http.Request) *Seeker {
 	return &Seeker{
 		ctx:       ctx,
@@ -37,6 +37,15 @@ func NewSeeker(ctx context.Context, transport http.RoundTripper, req *http.Reque
 		req:       req,
 		size:      -1,
 	}
+}
+
+type HTTPClient interface {
+	Do(r *http.Request) (*http.Response, error)
+}
+
+// NewSeekerWithHTTPClient creates a Seeker that includes HTTP client capabilities to handle redirects.
+func NewSeekerWithHTTPClient(ctx context.Context, httpClient HTTPClient, req *http.Request) *Seeker {
+	return NewSeeker(ctx, httpClientToRoundTripper{httpClient}, req)
 }
 
 type Seeker struct {
@@ -69,7 +78,7 @@ func (s *Seeker) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
-// Seek sets the offset for the next Read to offset.
+// Seek sets the offset for the next Read to the specified offset.
 func (s *Seeker) Seek(offset int64, whence int) (int64, error) {
 	var newOffset int64
 	switch whence {
@@ -109,6 +118,11 @@ func (s *Seeker) seek(ctx context.Context, offset uint64) error {
 // Close closes the Seeker.
 func (s *Seeker) Close() error {
 	return s.reset()
+}
+
+// OK indicates whether the Seeker is ready to be read.
+func (s *Seeker) OK() bool {
+	return s.rc != nil
 }
 
 // Response returns the first HTTP response received from the server.
@@ -171,7 +185,7 @@ func reader(ctx context.Context, transport http.RoundTripper, req *http.Request,
 		return resp.Body, s, nil, nil
 	}
 
-	return resp.Body, -1, resp, nil
+	return nil, -1, resp, nil
 }
 
 func getContentLength(contentRange string, readerOffset uint64, readerSize int64) (int64, error) {
@@ -215,4 +229,12 @@ func getContentLength(contentRange string, readerOffset uint64, readerSize int64
 		return 0, fmt.Errorf("Content-Range size: %d exceeds max allowed size", size)
 	}
 	return int64(size), nil
+}
+
+type httpClientToRoundTripper struct {
+	client HTTPClient
+}
+
+func (h httpClientToRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	return h.client.Do(r)
 }

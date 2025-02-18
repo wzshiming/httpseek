@@ -42,6 +42,10 @@ func (t *mustReaderTransport) RoundTrip(r *http.Request) (resp *http.Response, e
 		}
 	}
 
+	if !rsc.OK() {
+		return resp, nil
+	}
+
 	size := rsc.Size()
 	if size <= 0 {
 		return resp, nil
