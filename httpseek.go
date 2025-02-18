@@ -228,7 +228,7 @@ func getContentLength(contentRange string, readerOffset uint64, readerSize int64
 		return 0, fmt.Errorf("range in Content-Range stops before the end of the content: %s", contentRange)
 	}
 
-	if readerOffset > 0 && size != uint64(readerSize) {
+	if readerSize > 0 && size != uint64(readerSize) {
 		return 0, fmt.Errorf("Content-Range size: %d does not match expected size: %d", size, readerSize)
 	}
 
