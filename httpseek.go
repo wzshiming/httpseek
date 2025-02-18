@@ -111,6 +111,11 @@ func (s *Seeker) Close() error {
 	return s.reset()
 }
 
+// OK indicates that it is ready to be read.
+func (s *Seeker) OK() bool {
+	return s.rc != nil
+}
+
 // Response returns the first HTTP response received from the server.
 func (s *Seeker) Response() (*http.Response, error) {
 	if s.firstResponse == nil {
@@ -171,7 +176,7 @@ func reader(ctx context.Context, transport http.RoundTripper, req *http.Request,
 		return resp.Body, s, nil, nil
 	}
 
-	return resp.Body, -1, resp, nil
+	return nil, -1, resp, nil
 }
 
 func getContentLength(contentRange string, readerOffset uint64, readerSize int64) (int64, error) {
