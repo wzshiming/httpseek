@@ -21,6 +21,9 @@ var (
 
 	// ErrNoContentRange is returned when the Content-Range header is missing from a 206 response.
 	ErrNoContentRange = errors.New("no Content-Range header found in HTTP 206 response")
+
+	// ErrUnsupported indicates that the target response is not supported, such as for 30x or 401 responses.
+	ErrUnsupported = errors.New("unsupported target response")
 )
 
 var (
@@ -65,6 +68,10 @@ func (s *Seeker) Read(p []byte) (n int, err error) {
 		if err != nil {
 			return 0, err
 		}
+	}
+
+	if s.rc == nil {
+		return 0, ErrUnsupported
 	}
 
 	n, err = s.rc.Read(p)
