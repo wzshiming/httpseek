@@ -104,7 +104,11 @@ func (s *Seeker) Seek(offset int64, whence int) (int64, error) {
 		return 0, errors.New("negative offset")
 	}
 
-	return newOffset, s.seek(s.ctx, uint64(newOffset))
+	if s.offset != uint64(newOffset) {
+		_ = s.reset()
+		s.offset = uint64(newOffset)
+	}
+	return newOffset, nil
 }
 
 func (s *Seeker) seek(ctx context.Context, offset uint64) error {
