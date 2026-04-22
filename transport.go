@@ -17,47 +17,82 @@ func NewMustReaderTransport(baseTransport http.RoundTripper, errorHandler func(*
 	}
 }
 
+func (t *mustReaderTransport) roundTrip(retry int, r *http.Request) (resp *http.Response, err error) {
+	resp, err = t.baseTransport.RoundTrip(r)
+	if err == nil {
+		return resp, nil
+	}
+
+	if t.errorHandler == nil {
+		return nil, err
+	}
+
+	if err = t.errorHandler(r, retry, err); err != nil {
+		return nil, err
+	}
+
+	return t.roundTrip(retry+1, r)
+}
+
 // RoundTrip executes a single HTTP transaction.
-func (t *mustReaderTransport) RoundTrip(r *http.Request) (resp *http.Response, err error) {
-	if r.Method != http.MethodGet {
+func (t *mustReaderTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	switch r.Method {
+	case http.MethodHead, http.MethodOptions:
+		return t.roundTrip(0, r)
+	case http.MethodGet:
+		// For GET requests, we need to handle potential retries with byte ranges if the server supports it.
+	default:
 		return t.baseTransport.RoundTrip(r)
 	}
 
-	if r.Header.Get(rangeKey) != "" {
-		return t.baseTransport.RoundTrip(r)
+	if rangeHeader := r.Header.Get(rangeKey); rangeHeader != "" {
+		start, end, ok := parseSingleRange(rangeHeader)
+		if !ok {
+			return t.roundTrip(0, r)
+		}
+		if start < 0 {
+			return t.roundTripWithSeeker(r, NewSuffixSeeker(r.Context(), t.baseTransport, r, end))
+		}
+		return t.roundTripWithSeeker(r, NewRangeSeeker(r.Context(), t.baseTransport, r, start, end))
 	}
 
-	var retry = 0
-	rsc := NewSeeker(r.Context(), t.baseTransport, r)
+	return t.roundTripWithSeeker(r, NewSeeker(r.Context(), t.baseTransport, r))
+}
+
+// roundTripWithSeeker performs a retriable GET using an existing Seeker.
+func (t *mustReaderTransport) roundTripWithSeeker(r *http.Request, rsc *Seeker) (*http.Response, error) {
+	var retry int
+	var resp *http.Response
+	var err error
 	for {
 		resp, err = rsc.Response()
 		if err == nil {
 			break
 		}
-		if t.errorHandler != nil {
-			if err = t.errorHandler(r, retry, err); err != nil {
-				return nil, err
-			}
-			retry++
+		if t.errorHandler == nil {
+			return nil, err
 		}
+		if err = t.errorHandler(r, retry, err); err != nil {
+			return nil, err
+		}
+		retry++
 	}
 
 	if !rsc.OK() {
 		return resp, nil
 	}
 
-	size := rsc.Size()
-	if size <= 0 {
+	if rsc.Size() <= 0 {
 		return resp, nil
 	}
 
-	var readerErrorHandler func(retry int, err error) error
+	var readerErrorHandler func(int, error) error
 	if t.errorHandler != nil {
 		readerErrorHandler = func(retry0 int, err error) error {
 			return t.errorHandler(r, retry+retry0, err)
 		}
 	}
 
-	resp.Body = NewMustReadSeekCloser(rsc, 0, readerErrorHandler)
+	resp.Body = NewMustReadSeekCloser(rsc, rsc.Offset(), readerErrorHandler)
 	return resp, nil
 }

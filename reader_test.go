@@ -26,7 +26,13 @@ func TestMustReadSeeker(t *testing.T) {
 	rsc := NewSeeker(ctx, s.Client().Transport, req)
 	defer rsc.Close()
 
-	r := NewMustReadSeeker(rsc, 0, nil)
+	r := NewMustReadSeeker(rsc, 0, func(retry int, err error) error {
+		if retry >= 10 {
+			return err
+		}
+		t.Log("Retry", "error", err, "times", retry)
+		return nil
+	})
 	_, err = r.Seek(6, 0)
 	if err != nil {
 		t.Fatal(err)
