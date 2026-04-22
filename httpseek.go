@@ -5,17 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
-	"regexp"
-	"strconv"
+)
+
+const (
+	rangeKey        = "Range"
+	contentRangeKey = "Content-Range"
 )
 
 var (
-	rangeKey           = "Range"
-	contentRangeKey    = "Content-Range"
-	contentRangeRegexp = regexp.MustCompile(`bytes ([0-9]+)-([0-9]+)/([0-9]+|\\*)`)
-
 	// ErrCodeForByteRange is returned when the HTTP status code is not 206 for a byte range request.
 	ErrCodeForByteRange = errors.New("expected HTTP 206 from byte range request")
 
@@ -34,11 +32,24 @@ var (
 
 // NewSeeker creates a new Seeker for reading from an HTTP endpoint using a GET request.
 func NewSeeker(ctx context.Context, transport http.RoundTripper, req *http.Request) *Seeker {
+	return NewRangeSeeker(ctx, transport, req, 0, -1)
+}
+
+// NewSuffixSeeker creates a Seeker that reads the last suffixLen bytes of an HTTP endpoint.
+// The actual byte range is resolved from the server's Content-Range response.
+func NewSuffixSeeker(ctx context.Context, transport http.RoundTripper, req *http.Request, suffixLen int64) *Seeker {
+	return NewRangeSeeker(ctx, transport, req, -1, suffixLen)
+}
+
+// NewRangeSeeker creates a Seeker that reads a bounded byte range [start, end] from an HTTP endpoint.
+// end is the inclusive end byte; -1 means open-ended (read to EOF).
+func NewRangeSeeker(ctx context.Context, transport http.RoundTripper, req *http.Request, start, end int64) *Seeker {
 	return &Seeker{
 		ctx:       ctx,
 		transport: transport,
 		req:       req,
-		size:      -1,
+		offset:    start,
+		end:       end,
 	}
 }
 
@@ -58,8 +69,9 @@ type Seeker struct {
 	firstResponse *http.Response
 
 	rc     io.ReadCloser
-	offset uint64
+	offset int64
 	size   int64
+	end    int64 // inclusive end byte for range reads; -1 for open-ended
 }
 
 func (s *Seeker) Read(p []byte) (n int, err error) {
@@ -74,9 +86,27 @@ func (s *Seeker) Read(p []byte) (n int, err error) {
 		return 0, ErrUnsupported
 	}
 
+	if s.end >= 0 {
+		// If the end byte is known, limit the read to the remaining bytes in the range.
+		remaining := s.end - s.offset + 1
+		if remaining <= 0 {
+			return 0, io.EOF
+		}
+		if int64(len(p)) > remaining {
+			p = p[:remaining]
+		}
+	}
+
 	n, err = s.rc.Read(p)
-	s.offset += uint64(n)
-	if err != nil && int64(s.offset) < s.size {
+	s.offset += int64(n)
+	// For range reads, determine the effective end; for whole-file reads, use total size.
+	atEnd := false
+	if s.end >= 0 {
+		atEnd = s.offset > s.end
+	} else {
+		atEnd = s.size > 0 && s.offset >= s.size
+	}
+	if err != nil && !atEnd {
 		_ = s.reset()
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
@@ -104,25 +134,26 @@ func (s *Seeker) Seek(offset int64, whence int) (int64, error) {
 		return 0, errors.New("negative offset")
 	}
 
-	if s.offset != uint64(newOffset) {
+	if s.offset != newOffset {
 		_ = s.reset()
-		s.offset = uint64(newOffset)
+		s.offset = newOffset
 	}
 	return newOffset, nil
 }
 
-func (s *Seeker) seek(ctx context.Context, offset uint64) error {
-	r, size, resp, err := reader(ctx, s.transport, s.req, offset, s.size)
+func (s *Seeker) seek(ctx context.Context, offset int64) error {
+	r, size, resolvedOffset, resolvedEnd, resp, err := reader(ctx, s.transport, s.req, offset, s.end)
 	if err != nil {
 		return err
 	}
 	_ = s.reset()
-	if offset == 0 {
+	if s.firstResponse == nil && resp != nil {
 		s.firstResponse = resp
 	}
 	s.size = size
-	s.offset = offset
 	s.rc = r
+	s.offset = resolvedOffset
+	s.end = resolvedEnd
 	return nil
 }
 
@@ -139,7 +170,7 @@ func (s *Seeker) OK() bool {
 // Response returns the first HTTP response received from the server.
 func (s *Seeker) Response() (*http.Response, error) {
 	if s.firstResponse == nil {
-		err := s.seek(s.ctx, 0)
+		err := s.seek(s.ctx, s.offset)
 		if err != nil {
 			return nil, err
 		}
@@ -153,7 +184,7 @@ func (s *Seeker) Size() int64 {
 }
 
 // Offset returns the current offset of the Seeker.
-func (s *Seeker) Offset() uint64 {
+func (s *Seeker) Offset() int64 {
 	return s.offset
 }
 
@@ -166,80 +197,57 @@ func (s *Seeker) reset() error {
 	return err
 }
 
-func reader(ctx context.Context, transport http.RoundTripper, req *http.Request, readerOffset uint64, readerSize int64) (io.ReadCloser, int64, *http.Response, error) {
+func reader(ctx context.Context, transport http.RoundTripper, req *http.Request, readerOffset int64, readerEnd int64) (io.ReadCloser, int64, int64, int64, *http.Response, error) {
 	req = req.Clone(ctx)
-	if readerOffset > 0 {
-		req.Header.Add(rangeKey, fmt.Sprintf("bytes=%d-", readerOffset))
+
+	switch {
+	case readerOffset < 0: // suffix range; readerEnd is the suffix length (positive)
+		req.Header.Set(rangeKey, fmt.Sprintf("bytes=-%d", readerEnd))
+	case readerOffset >= 0 && readerEnd >= 0:
+		req.Header.Set(rangeKey, fmt.Sprintf("bytes=%d-%d", readerOffset, readerEnd))
+	case readerOffset >= 0 && readerEnd < 0:
+		req.Header.Set(rangeKey, fmt.Sprintf("bytes=%d-", readerOffset))
+	default:
+		return nil, -1, readerOffset, readerEnd, nil, fmt.Errorf("invalid reader offset and end: %d, %d", readerOffset, readerEnd)
 	}
 
 	resp, err := transport.RoundTrip(req)
 	if err != nil {
-		return nil, -1, nil, err
+		return nil, -1, readerOffset, readerEnd, nil, err
 	}
 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusNoContent:
 		if readerOffset == 0 {
-			return resp.Body, resp.ContentLength, resp, nil
+			return resp.Body, resp.ContentLength, readerOffset, readerEnd, resp, nil
 		}
-		return nil, -1, nil, ErrCodeForByteRange
+		resp.Body.Close()
+		return nil, -1, readerOffset, readerEnd, nil, ErrCodeForByteRange
 	case http.StatusPartialContent:
 		contentRange := resp.Header.Get(contentRangeKey)
 		if contentRange == "" {
-			return nil, -1, nil, ErrNoContentRange
+			resp.Body.Close()
+			return nil, -1, readerOffset, readerEnd, nil, ErrNoContentRange
 		}
 
-		s, err := getContentLength(contentRange, readerOffset, readerSize)
-		if err != nil {
-			return nil, -1, nil, err
+		actualStart, actualEnd, total, ok := parseContentRange(contentRange)
+		if !ok {
+			resp.Body.Close()
+			return nil, -1, readerOffset, readerEnd, nil, fmt.Errorf("could not parse Content-Range header: %s", contentRange)
 		}
-		return resp.Body, s, nil, nil
+		if readerOffset >= 0 && actualStart != readerOffset {
+			resp.Body.Close()
+			return nil, -1, readerOffset, readerEnd, nil, fmt.Errorf("unexpected Content-Range start: got %d, want %d", actualStart, readerOffset)
+		}
+		if readerOffset >= 0 && readerEnd >= 0 && actualEnd > readerEnd {
+			resp.Body.Close()
+			return nil, -1, readerOffset, readerEnd, nil, fmt.Errorf("unexpected Content-Range end: got %d, want <= %d", actualEnd, readerEnd)
+		}
+		return resp.Body, total, actualStart, actualEnd, resp, nil
 	}
 
-	return nil, -1, resp, nil
-}
-
-func getContentLength(contentRange string, readerOffset uint64, readerSize int64) (int64, error) {
-	submatches := contentRangeRegexp.FindStringSubmatch(contentRange)
-	if len(submatches) < 4 {
-		return 0, fmt.Errorf("could not parse Content-Range header: %s", contentRange)
-	}
-
-	startByte, err := strconv.ParseUint(submatches[1], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("could not parse start of range in Content-Range header: %s", contentRange)
-	}
-
-	if startByte != readerOffset {
-		return 0, fmt.Errorf("received Content-Range starting at offset %d instead of requested %d", startByte, readerOffset)
-	}
-
-	endByte, err := strconv.ParseUint(submatches[2], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("could not parse end of range in Content-Range header: %s", contentRange)
-	}
-
-	if submatches[3] == "*" {
-		return -1, nil
-	}
-
-	size, err := strconv.ParseUint(submatches[3], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("could not parse total size in Content-Range header: %s", contentRange)
-	}
-
-	if endByte+1 != size {
-		return 0, fmt.Errorf("range in Content-Range stops before the end of the content: %s", contentRange)
-	}
-
-	if readerSize > 0 && size != uint64(readerSize) {
-		return 0, fmt.Errorf("Content-Range size: %d does not match expected size: %d", size, readerSize)
-	}
-
-	if size > math.MaxInt64 {
-		return 0, fmt.Errorf("Content-Range size: %d exceeds max allowed size", size)
-	}
-	return int64(size), nil
+	resp.Body.Close()
+	return nil, -1, readerOffset, readerEnd, resp, nil
 }
 
 type httpClientToRoundTripper struct {
