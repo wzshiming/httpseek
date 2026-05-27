@@ -205,10 +205,10 @@ func reader(ctx context.Context, transport http.RoundTripper, req *http.Request,
 		req.Header.Set(rangeKey, fmt.Sprintf("bytes=-%d", readerEnd))
 	case readerOffset >= 0 && readerEnd >= 0:
 		req.Header.Set(rangeKey, fmt.Sprintf("bytes=%d-%d", readerOffset, readerEnd))
-	case readerOffset >= 0 && readerEnd < 0:
+	case readerOffset > 0: // open-ended range from a non-zero offset
 		req.Header.Set(rangeKey, fmt.Sprintf("bytes=%d-", readerOffset))
 	default:
-		return nil, -1, readerOffset, readerEnd, nil, fmt.Errorf("invalid reader offset and end: %d, %d", readerOffset, readerEnd)
+		// readerOffset == 0 && readerEnd < 0: plain full-file GET, no Range header needed
 	}
 
 	resp, err := transport.RoundTrip(req)
