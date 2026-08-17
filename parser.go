@@ -85,3 +85,16 @@ func parseContentRange(contentRange string) (start, end, total int64, ok bool) {
 	}
 	return startVal, endVal, totalVal, true
 }
+
+// parseUnsatisfiedContentRange parses a 416 Content-Range header "bytes */<total>".
+func parseUnsatisfiedContentRange(contentRange string) (total int64, ok bool) {
+	const prefix = "bytes */"
+	if !strings.HasPrefix(contentRange, prefix) {
+		return 0, false
+	}
+	totalVal, err := strconv.ParseInt(contentRange[len(prefix):], 10, 64)
+	if err != nil || totalVal < 0 {
+		return 0, false
+	}
+	return totalVal, true
+}
