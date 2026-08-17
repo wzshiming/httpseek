@@ -8,10 +8,12 @@ type mustReadSeeker struct {
 	readSeeker   io.ReadSeeker
 	errorHandler func(int, error) error
 	offset       int64
-	err          error
 }
 
-// NewMustReadSeeker returns a reader that will retry reading with partial byte ranges if the underlying reader returns an error.
+// NewMustReadSeeker returns a reader that retries reading if the underlying reader
+// returns an error. offset must be the current absolute position of rsc; it is used
+// to restore the position before retrying. errorHandler receives the retry count and
+// the error; returning a non-nil error stops retrying and is reported to the caller.
 func NewMustReadSeeker(rsc io.ReadSeeker, offset int64, errorHandler func(int, error) error) io.ReadSeeker {
 	return &mustReadSeeker{
 		readSeeker:   rsc,
@@ -32,58 +34,42 @@ func NewMustReadSeekCloser(rsc io.ReadSeekCloser, offset int64, errorHandler fun
 }
 
 func (r *mustReadSeeker) Seek(offset int64, whence int) (int64, error) {
-	return r.seek(0, offset, whence)
-}
-
-func (r *mustReadSeeker) seek(retry int, offset int64, whence int) (int64, error) {
-	abs, err := r.readSeeker.Seek(offset, whence)
-	if err == nil {
-		r.offset = abs
-		r.err = nil
-		return abs, nil
+	for retry := 0; ; retry++ {
+		abs, err := r.readSeeker.Seek(offset, whence)
+		if err == nil {
+			r.offset = abs
+			return abs, nil
+		}
+		if r.errorHandler == nil {
+			return abs, err
+		}
+		if err = r.errorHandler(retry, err); err != nil {
+			return 0, err
+		}
 	}
-
-	if r.errorHandler == nil {
-		return abs, err
-	}
-
-	if err = r.errorHandler(retry, err); err != nil {
-		return 0, err
-	}
-
-	return r.seek(retry+1, offset, whence)
 }
 
 // Read reads from the reader.
 func (r *mustReadSeeker) Read(p []byte) (n int, err error) {
-	if r.err != nil {
-		return 0, r.err
+	for retry := 0; ; retry++ {
+		n, err = r.readSeeker.Read(p)
+		r.offset += int64(n)
+		if err == nil || err == io.EOF {
+			return n, err
+		}
+		if r.errorHandler == nil {
+			return n, err
+		}
+		if err = r.errorHandler(retry, err); err != nil {
+			return n, err
+		}
+		if n != 0 {
+			// Partial data was read; report it and let the next Read continue.
+			return n, nil
+		}
+		// Restore the position in case the underlying reader drifted.
+		if _, serr := r.readSeeker.Seek(r.offset, io.SeekStart); serr != nil {
+			return 0, serr
+		}
 	}
-	return r.read(0, p)
-}
-
-func (r *mustReadSeeker) read(retry int, p []byte) (n int, err error) {
-	n, err = r.readSeeker.Read(p)
-
-	r.offset += int64(n)
-	if err == nil {
-		return n, nil
-	}
-
-	if err == io.EOF {
-		return n, err
-	}
-
-	if r.errorHandler == nil {
-		return n, err
-	}
-
-	if err = r.errorHandler(retry, err); err != nil {
-		return n, err
-	}
-
-	if n != 0 {
-		return n, nil
-	}
-	return r.read(retry+1, p)
 }

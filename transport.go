@@ -1,7 +1,9 @@
 package httpseek
 
 import (
+	"errors"
 	"net/http"
+	"time"
 )
 
 type mustReaderTransport struct {
@@ -17,21 +19,50 @@ func NewMustReaderTransport(baseTransport http.RoundTripper, errorHandler func(*
 	}
 }
 
+// RetryWithBackoff returns an error handler for NewMustReaderTransport that retries
+// up to maxRetries times with exponential backoff starting at base (no sleep if base <= 0).
+func RetryWithBackoff(maxRetries int, base time.Duration) func(*http.Request, int, error) error {
+	const maxBackoff = 30 * time.Second
+	return func(req *http.Request, retry int, err error) error {
+		ctx := req.Context()
+		if contextErr := ctx.Err(); contextErr != nil {
+			return errors.Join(err, contextErr)
+		}
+		if retry >= maxRetries {
+			return err
+		}
+		if base <= 0 {
+			return nil
+		}
+		d := base << uint(retry)
+		if d <= 0 || d > maxBackoff {
+			d = maxBackoff
+		}
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return errors.Join(err, ctx.Err())
+		case <-t.C:
+			return nil
+		}
+	}
+}
+
 func (t *mustReaderTransport) roundTrip(retry int, r *http.Request) (resp *http.Response, err error) {
-	resp, err = t.baseTransport.RoundTrip(r)
-	if err == nil {
-		return resp, nil
+	for {
+		resp, err = t.baseTransport.RoundTrip(r)
+		if err == nil {
+			return resp, nil
+		}
+		if t.errorHandler == nil {
+			return nil, err
+		}
+		if err = t.errorHandler(r, retry, err); err != nil {
+			return nil, err
+		}
+		retry++
 	}
-
-	if t.errorHandler == nil {
-		return nil, err
-	}
-
-	if err = t.errorHandler(r, retry, err); err != nil {
-		return nil, err
-	}
-
-	return t.roundTrip(retry+1, r)
 }
 
 // RoundTrip executes a single HTTP transaction.
