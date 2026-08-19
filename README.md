@@ -23,6 +23,14 @@ io.ReadAll(rsc)
 Also available: `NewRangeSeeker` (bounded range), `NewSuffixSeeker` (last N bytes),
 and `NewSeekerWithHTTPClient` (follows redirects via an `*http.Client`).
 
+Seeking from `io.SeekEnd` learns an unknown size with a HEAD probe, falling
+back to a ranged request when HEAD is unsupported; `Size()` reports -1 while
+the total is still unknown.
+
+The seek logic is protocol-agnostic: implement `Opener` (ranged opens plus a
+size probe) and wrap it with `NewOpenSeeker` / `NewRangeOpenSeeker` /
+`NewSuffixOpenSeeker` to get the same `io.ReadSeekCloser` over any resource.
+
 `NewMustReaderTransport` wraps a `http.RoundTripper` so interrupted GET downloads
 are transparently resumed with Range requests:
 

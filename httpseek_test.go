@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -52,6 +53,201 @@ func TestSeek(t *testing.T) {
 
 	if string(got) != "World!" {
 		t.Fatalf("got %q, want %q", got, "World!")
+	}
+}
+
+// chunkedRangeHandler serves content chunked (no Content-Length) for plain
+// GETs, answers "bytes=N-" range requests, and rejects HEAD.
+func chunkedRangeHandler(content []byte, methods *[]string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		*methods = append(*methods, r.Method)
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var start int64
+		if rng := r.Header.Get("Range"); rng != "" {
+			if _, err := fmt.Sscanf(rng, "bytes=%d-", &start); err != nil || start >= int64(len(content)) {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(content)-1, len(content)))
+			w.Header().Set("Content-Length", fmt.Sprint(int64(len(content))-start))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(content[start:])
+			return
+		}
+		_, _ = w.Write(content[:1])
+		w.(http.Flusher).Flush()
+		_, _ = w.Write(content[1:])
+	}
+}
+
+func TestSeekEndUnknownSizeHeadRejected(t *testing.T) {
+	ctx := context.Background()
+
+	// SeekEnd probes an unknown size with HEAD first; a server rejecting HEAD
+	// falls back to a ranged open, whose Content-Range total answers the seek.
+	content := []byte("Hello World!")
+	var methods []string
+	s := httptest.NewServer(chunkedRangeHandler(content, &methods))
+	defer s.Close()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsc := NewSeeker(ctx, s.Client().Transport, req)
+	defer rsc.Close()
+
+	if _, err := rsc.Seek(6, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	offset, err := rsc.Seek(0, io.SeekEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offset != int64(len(content)) {
+		t.Fatalf("got offset %d, want %d", offset, len(content))
+	}
+	want := []string{http.MethodHead, http.MethodGet}
+	if len(methods) != len(want) || methods[0] != want[0] || methods[1] != want[1] {
+		t.Fatalf("got methods %v, want %v", methods, want)
+	}
+
+	// The learned size is cached; this SeekEnd resolves without a request.
+	if _, err := rsc.Seek(-6, io.SeekEnd); err != nil {
+		t.Fatal(err)
+	}
+	if len(methods) != len(want) {
+		t.Fatalf("got %d requests %v, want %d (size must be cached)", len(methods), methods, len(want))
+	}
+	got, err := io.ReadAll(rsc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "World!" {
+		t.Fatalf("got %q, want %q", got, "World!")
+	}
+}
+
+func TestSeekEndUnknownSizeHeadProbe(t *testing.T) {
+	ctx := context.Background()
+
+	// Chunked GETs never report a size; SeekEnd learns it from a HEAD probe.
+	content := []byte("Hello World!")
+	var methods []string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprint(len(content)))
+			return
+		}
+		_, _ = w.Write(content[:1])
+		w.(http.Flusher).Flush()
+		_, _ = w.Write(content[1:])
+	}))
+	defer s.Close()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsc := NewSeeker(ctx, s.Client().Transport, req)
+	defer rsc.Close()
+
+	offset, err := rsc.Seek(0, io.SeekEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offset != int64(len(content)) {
+		t.Fatalf("got offset %d, want %d", offset, len(content))
+	}
+	want := []string{http.MethodHead}
+	if len(methods) != len(want) || methods[0] != want[0] {
+		t.Fatalf("got methods %v, want %v", methods, want)
+	}
+
+	// The learned size is cached; another SeekEnd must not issue any request.
+	if _, err := rsc.Seek(-6, io.SeekEnd); err != nil {
+		t.Fatal(err)
+	}
+	if len(methods) != len(want) {
+		t.Fatalf("got %d requests %v, want %d (size must be cached)", len(methods), methods, len(want))
+	}
+}
+
+func TestSeekEndHeadContentChanged(t *testing.T) {
+	ctx := context.Background()
+
+	// The HEAD size probe must reject a size belonging to changed content.
+	etag := `"v1"`
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", etag)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "12")
+			return
+		}
+		_, _ = w.Write([]byte("Hello "))
+		w.(http.Flusher).Flush()
+		_, _ = w.Write([]byte("World!"))
+	}))
+	defer s.Close()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsc := NewSeeker(ctx, s.Client().Transport, req)
+	defer rsc.Close()
+
+	// The first open captures the validator.
+	if _, err := rsc.Response(); err != nil {
+		t.Fatal(err)
+	}
+
+	etag = `"v2"`
+	if _, err := rsc.Seek(0, io.SeekEnd); !errors.Is(err, ErrContentChanged) {
+		t.Fatalf("got %v, want ErrContentChanged", err)
+	}
+}
+
+func TestInvalid206Response(t *testing.T) {
+	ctx := context.Background()
+
+	// A 206 must carry a Content-Range consistent with the requested range.
+	cases := []struct {
+		name         string
+		contentRange string // "" means the header is omitted
+		wantErr      error
+	}{
+		{"missing content-range", "", ErrNoContentRange},
+		{"unparsable content-range", "bytes garbage", ErrInvalidContentRange},
+		{"wrong start", "bytes 4-11/12", ErrInvalidContentRange},
+		{"end overshoot", "bytes 2-8/12", ErrInvalidContentRange},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.contentRange != "" {
+					w.Header().Set("Content-Range", tc.contentRange)
+				}
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write([]byte("lo W"))
+			}))
+			defer s.Close()
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rsc := NewRangeSeeker(ctx, s.Client().Transport, req, 2, 5)
+			defer rsc.Close()
+
+			if _, err := io.ReadAll(rsc); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("got %v, want %v", err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -226,8 +422,8 @@ func TestSeekEndBeforeRead(t *testing.T) {
 	if string(got) != "World!" {
 		t.Fatalf("got %q, want %q", got, "World!")
 	}
-	if requests != 1 {
-		t.Fatalf("got %d requests, want 1 (probe reused via forward discard)", requests)
+	if requests != 2 {
+		t.Fatalf("got %d requests, want 2 (HEAD probe, then range read)", requests)
 	}
 }
 
